@@ -621,19 +621,12 @@ function ip_select_options($ips, $nat_value = false) {
 		$public = empty($value["NAT"]) ? $ip : $value["NAT"];
 		$ip6 = $value["IP6"] ?? "";
 		$v4[] = ["value" => $nat_value ? $public : $ip, "label" => $public, "ip6" => $ip6];
-		if ($ip6 !== "") {
-			$v6[$ip6][] = $public;
+		// Each paired address once, even if paired with several IPs
+		if ($ip6 !== "" && !in_array($ip6, array_column($v6, "addr"), true)) {
+			$v6[] = ["addr" => $ip6, "label" => $ip6];
 		}
 	}
-	$v6_list = [];
-	foreach ($v6 as $addr => $owners) {
-		$v6_list[] = [
-			"addr" => $addr,
-			"label" => $addr,
-			"note" => sprintf(_("paired with %s"), implode(", ", $owners)),
-		];
-	}
-	return ["v4" => $v4, "v6" => $v6_list];
+	return ["v4" => $v4, "v6" => $v6];
 }
 
 /**

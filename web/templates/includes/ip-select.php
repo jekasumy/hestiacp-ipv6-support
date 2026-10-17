@@ -6,7 +6,7 @@
  *
  * Expects $ip_select = [
  *   "v4"          => [["value" => ..., "label" => ..., "ip6" => paired IPv6 or ""], ...],
- *   "v6"          => [["addr" => ..., "label" => ..., "note" => ...], ...],
+ *   "v6"          => [["addr" => ..., "label" => ...], ...],
  *   "v4_selected" => currently selected IPv4 value,
  *   "ip6_stored"  => stored IPV6 value ("" = default, "no", or a comma-separated list),
  *   "wildcard"    => IPv6 address used by default when the selected IPv4 has none paired
@@ -50,7 +50,7 @@ if ($ip_select_stored === "" || $ip_select_stored === "yes") {
 $ip_select_v6_list = $ip_select["v6"];
 foreach ($ip_select_v6 as $addr) {
 	if ($addr !== $ip_select["wildcard"] && !in_array($addr, array_column($ip_select_v6_list, "addr"), true)) {
-		$ip_select_v6_list[] = ["addr" => $addr, "label" => $addr, "note" => ""];
+		$ip_select_v6_list[] = ["addr" => $addr, "label" => $addr];
 	}
 }
 
@@ -163,10 +163,7 @@ $ip_select_state = [
 						x-bind:checked="v6.includes(item.addr)"
 						x-on:change="toggleV6(item.addr, $event.target.checked)"
 					>
-					<label x-bind:for="'v_ipv6_' + item.addr">
-						<span x-text="item.label"></span>
-						<small class="hint" x-show="item.note" x-text="item.note"></small>
-					</label>
+					<label x-bind:for="'v_ipv6_' + item.addr" x-text="item.label"></label>
 				</div>
 			</template>
 			<template x-if="!v6list.length">

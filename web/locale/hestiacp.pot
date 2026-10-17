@@ -5145,8 +5145,3 @@ msgid ""
 "No IPv6 addresses are paired with your IPs yet - pair one on the Edit IP "
 "page."
 msgstr ""
-
-#: ../../web/inc/main.php
-#, php-format
-msgid "paired with %s"
-msgstr ""
