@@ -125,7 +125,7 @@ of an existing Hestia server and can be removed again.
 As root:
 
 ```bash
-git clone https://github.com/<your-account>/<this-repository>.git hestiacp-ipv6
+git clone https://github.com/jekasumy/hestiacp-ipv6-support.git hestiacp-ipv6-support
 cd hestiacp-ipv6
 ./install-ipv6-patch.sh
 ```
