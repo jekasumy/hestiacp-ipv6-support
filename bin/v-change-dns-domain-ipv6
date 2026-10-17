@@ -164,6 +164,9 @@ if [ -n "$lnr" ]; then
 	fi
 fi
 
+# Keep AAAA records next to the A record of the same host
+sort_dns_aaaa_records "$zone" > /dev/null
+
 # Update serial
 update_domain_serial
 # Updating zone

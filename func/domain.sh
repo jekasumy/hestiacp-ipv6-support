@@ -805,6 +805,81 @@ add_dns_host_ip6_records() {
 			$BIN/v-add-dns-record "$user" "$zone" "$host" AAAA "$addr" '' '' "$restart" '' 'yes'
 		fi
 	done
+	# Keep them next to the host's A record
+	if [ -n "$(sort_dns_aaaa_records "$HESTIA/data/users/$user/dns/$zone.conf")" ] && [ "$DNS_CLUSTER" = "yes" ]; then
+		# Record IDs changed: resync the whole zone to the cluster
+		if ! grep -q "domain $user $zone " "$HESTIA/data/queue/dns-cluster.pipe" 2> /dev/null; then
+			echo "$BIN/v-add-remote-dns-domain $user $zone yes" >> "$HESTIA/data/queue/dns-cluster.pipe"
+		fi
+	fi
+}
+
+# Move the AAAA records of DNS zone record file $1 right after the A
+# record(s) of the same host, so IPv4 and IPv6 sit next to each other in
+# the record list (records added later, e.g. when an IPv6 address gets
+# paired, are otherwise appended at the end). AAAA records of hosts
+# without an A record stay where they are. The record IDs already in
+# use are handed out again in the new order, so records before the
+# first moved one keep their IDs. Prints "changed" if anything moved.
+sort_dns_aaaa_records() {
+	local conf="$1" result
+	[ -s "$conf" ] || return 0
+	result="$(awk -v q="'" '
+		function field(line, k,   m) {
+			if (match(line, "(^| )" k "=" q "[^" q "]*" q)) {
+				m = substr(line, RSTART, RLENGTH)
+				sub("^ ?" k "=" q, "", m)
+				sub(q "$", "", m)
+				return m
+			}
+			return ""
+		}
+		{
+			n++; line[n] = $0; rec[n] = field($0, "RECORD"); type[n] = field($0, "TYPE")
+			id[n] = field($0, "ID") + 0
+			if (type[n] == "A") last_a[rec[n]] = n
+		}
+		END {
+			# AAAA records of hosts that have an A record, in their current order
+			for (i = 1; i <= n; i++) {
+				if (type[i] == "AAAA" && (rec[i] in last_a)) {
+					moved[i] = 1
+					cnt[rec[i]]++
+					aaaa[rec[i], cnt[rec[i]]] = i
+				}
+			}
+			m = 0
+			for (i = 1; i <= n; i++) {
+				if (i in moved) continue
+				order[++m] = i
+				if (type[i] == "A" && last_a[rec[i]] == i) {
+					for (j = 1; j <= cnt[rec[i]]; j++) order[++m] = aaaa[rec[i], j]
+				}
+			}
+			changed = 0
+			for (i = 1; i <= n; i++) if (order[i] != i) changed = 1
+			if (!changed) exit 0
+			# The IDs in use, ascending, handed out in the new order
+			for (i = 1; i <= n; i++) ids[i] = id[i]
+			for (i = 2; i <= n; i++) {
+				v = ids[i]; j = i - 1
+				while (j > 0 && ids[j] > v) { ids[j + 1] = ids[j]; j-- }
+				ids[j + 1] = v
+			}
+			for (i = 1; i <= n; i++) {
+				l = line[order[i]]
+				sub("^ID=" q "[0-9]+" q, "ID=" q ids[i] q, l)
+				print l > (FILENAME ".tmp")
+			}
+			close(FILENAME ".tmp")
+			print "changed"
+		}
+	' "$conf")"
+	if [ "$result" = "changed" ] && [ -s "$conf.tmp" ]; then
+		mv -f "$conf.tmp" "$conf"
+		echo changed
+	fi
+	rm -f "$conf.tmp"
 }
 
 # Expand the %ip6% (AAAA) lines of a DNS zone template read from stdin
