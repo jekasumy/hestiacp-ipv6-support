@@ -33,6 +33,7 @@ if ($_SESSION["userSortOrder"] == "name") {
 // column next to the IPs themselves (IP_OWNED only counts the IPv4
 // records, an IPv6 address is paired with one rather than an IP of its own)
 $v_ip6_owned = [];
+unset($output);
 exec(HESTIA_CMD . "v-list-sys-ips json", $output, $return_var);
 if ($return_var == 0) {
 	foreach (json_decode(implode("", $output), true) ?: [] as $ip_data) {
