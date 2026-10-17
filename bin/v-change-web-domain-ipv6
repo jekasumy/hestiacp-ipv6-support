@@ -1,0 +1,136 @@
+#!/bin/bash
+# info: change which IPv6 addresses (if any) a web domain listens on
+# options: USER DOMAIN IPV6[addresses/no/''] [RESTART]
+#
+# example: v-change-web-domain-ipv6 admin wonderland.com no
+# example: v-change-web-domain-ipv6 admin wonderland.com 2a01:4f8:1c1f:7092::1,2a01:4f8:1c1f:7092::2
+#
+# This function changes which IPv6 addresses a web domain listens on,
+# independently of which one (if any) is paired with the IP it uses
+# (see v-change-sys-ip-ipv6): pass a comma-separated list of addresses
+# to use exactly those (they don't need to belong to this domain's own
+# IP - useful on a server with several IPv4 addresses, each with its
+# own paired IPv6), "no" to keep the domain IPv4-only, or an empty
+# value to go back to the default of listening on whichever IPv6
+# address (if any) is paired with this domain's own IP.
+
+#----------------------------------------------------------#
+#                Variables & Functions                     #
+#----------------------------------------------------------#
+
+# Argument definition
+user=$1
+domain=$2
+domain_idn=$2
+ip6_list=$3
+restart=$4
+
+# Includes
+# shellcheck source=/etc/hestiacp/hestia.conf
+source /etc/hestiacp/hestia.conf
+# shellcheck source=/usr/local/hestia/func/main.sh
+source $HESTIA/func/main.sh
+# shellcheck source=/usr/local/hestia/func/domain.sh
+source $HESTIA/func/domain.sh
+# shellcheck source=/usr/local/hestia/func/ip.sh
+source $HESTIA/func/ip.sh
+# load config file
+source_conf "$HESTIA/conf/hestia.conf"
+
+# Additional argument formatting
+format_domain
+format_domain_idn
+
+#----------------------------------------------------------#
+#                    Verifications                         #
+#----------------------------------------------------------#
+
+check_args '3' "$#" "USER DOMAIN IPV6[address/no/''] [RESTART]"
+is_format_valid 'user' 'domain' 'restart' 'ip6_list'
+ip6_list="$(normalize_ip6_list "$ip6_list")"
+is_system_enabled "$WEB_SYSTEM" 'WEB_SYSTEM'
+is_object_valid 'user' 'USER' "$user"
+is_object_unsuspended 'user' 'USER' "$user"
+is_ip6_list_available "$ip6_list"
+is_object_valid 'web' 'DOMAIN' "$domain"
+is_object_unsuspended 'web' 'DOMAIN' "$domain"
+
+# Perform verification if read-only mode is enabled
+check_hestia_demo_mode
+
+#----------------------------------------------------------#
+#                       Action                             #
+#----------------------------------------------------------#
+
+# Preparing variables for vhost rebuild. $IPV6 is only declared in a
+# domain's web.conf entry if the field has ever been written for it
+# (see v-add-web-domain) - reset it first so a domain that predates
+# this field doesn't inherit a stale value from this shell.
+IPV6=''
+get_domain_values 'web'
+is_ip_valid $IP
+prepare_web_domain_values
+
+# add_web_config regenerates the config from scratch (unlike
+# replace_web_config's plain string substitution), which is needed
+# here since changing IPv6 can add or remove a whole listen directive
+# (nginx) or a bracketed address segment (apache), not just swap one
+# value for another.
+IPV6="$ip6_list"
+
+add_web_config "$WEB_SYSTEM" "$TPL.tpl"
+if [ "$SSL" = 'yes' ]; then
+	add_web_config "$WEB_SYSTEM" "$TPL.stpl"
+fi
+
+if [ -n "$PROXY_SYSTEM" ] && [ -n "$PROXY" ]; then
+	add_web_config "$PROXY_SYSTEM" "$PROXY.tpl"
+	if [ "$SSL" = 'yes' ]; then
+		add_web_config "$PROXY_SYSTEM" "$PROXY.stpl"
+	fi
+fi
+
+#----------------------------------------------------------#
+#                       Hestia                             #
+#----------------------------------------------------------#
+
+# Update config. A domain added before this field existed has no
+# IPV6= key in its web.conf row at all, so update_object_value's
+# plain find/replace (which assumes the key is already there) can't
+# be relied on - insert it next to DOMAIN= the first time, and only
+# replace in place once it exists.
+row_line="$(grep -n "DOMAIN='$domain' " "$USER_DATA/web.conf" | head -n1)"
+lnr="${row_line%%:*}"
+if [ -n "$lnr" ]; then
+	if echo "${row_line#*:}" | grep -q "IPV6="; then
+		sed -i "$lnr s/IPV6='[^']*'/IPV6='$ip6_list'/" "$USER_DATA/web.conf"
+	else
+		sed -i "$lnr s/DOMAIN='$domain' /DOMAIN='$domain' IPV6='$ip6_list' /" "$USER_DATA/web.conf"
+	fi
+fi
+
+# Webmail listens on the same IPv6 addresses as the website (see
+# add_webmail_config)
+if [ -n "$IMAP_SYSTEM" ] && [ -n "$(grep "^DOMAIN='$domain' " "$USER_DATA/mail.conf" 2> /dev/null)" ]; then
+	$BIN/v-rebuild-mail-domain "$user" "$domain" 'no'
+fi
+
+# Restart web server
+$BIN/v-restart-web "$restart"
+check_result $? "Web restart failed" > /dev/null
+
+$BIN/v-restart-proxy "$restart"
+check_result $? "Proxy restart failed" > /dev/null
+
+# Logging
+if [ "$ip6_list" = 'no' ]; then
+	ipv6_log='disabled'
+elif [ -n "$ip6_list" ]; then
+	ipv6_log="set to $ip6_list"
+else
+	ipv6_log='reset to the IP default'
+fi
+$BIN/v-log-action "$user" "Info" "Web" "IPv6 $ipv6_log (Domain: $domain)."
+log_event "$OK" "$ARGUMENTS"
+
+exit

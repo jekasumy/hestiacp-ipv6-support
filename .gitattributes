@@ -1,0 +1,6 @@
+# Keep Unix line endings everywhere - bash scripts and Hestia's config
+# templates break with CRLF (e.g. when committed from Windows)
+* text=auto eol=lf
+*.mo binary
+*.png binary
+*.svg text eol=lf

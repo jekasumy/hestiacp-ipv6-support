@@ -1,0 +1,376 @@
+#!/bin/bash
+# info: update system firewall rules
+# options: NONE
+#
+# example: v-update-firewall
+#
+# This function updates iptables rules, and mirrors the same rule set onto
+# ip6tables when it is available, so IPv6 traffic is filtered by the same
+# policy as IPv4 instead of passing through unfiltered.
+
+#----------------------------------------------------------#
+#                Variables & Functions                     #
+#----------------------------------------------------------#
+
+# Defining absolute path for iptables and modprobe
+iptables="/sbin/iptables"
+ip6tables="/sbin/ip6tables"
+modprobe="/sbin/modprobe"
+sysctl="/sbin/sysctl"
+
+# Includes
+source /etc/profile.d/hestia.sh
+# shellcheck source=/etc/hestiacp/hestia.conf
+source /etc/hestiacp/hestia.conf
+# shellcheck source=/usr/local/hestia/func/main.sh
+source "$HESTIA/func/main.sh"
+# shellcheck source=/usr/local/hestia/func/firewall.sh
+source "$HESTIA/func/firewall.sh"
+# load config file
+source_conf "$HESTIA/conf/hestia.conf"
+
+#----------------------------------------------------------#
+#                    Verifications                         #
+#----------------------------------------------------------#
+
+is_system_enabled "$FIREWALL_SYSTEM" 'FIREWALL_SYSTEM'
+
+# Acquire firewall lock to serialize concurrent firewall state modifications
+# (fail2ban ban/unban, rule changes, etc.)
+if [ -z "${HESTIA_FIREWALL_LOCK_HELD:-}" ]; then
+	exec 9> /run/hestia-firewall.lock
+	check_result $? "Unable to create firewall lock file"
+	flock -w 30 9
+	check_result $? "Unable to acquire firewall lock (timeout after 30s)"
+	export HESTIA_FIREWALL_LOCK_HELD=1
+fi
+
+#----------------------------------------------------------#
+#                       Action                             #
+#----------------------------------------------------------#
+
+# Self heal iptables links (also heals ip6tables links, see func/firewall.sh)
+heal_iptables_links
+
+# Only build/apply the ip6tables ruleset if the binary is actually present
+# on this box - never fail the whole (v4) firewall run just because IPv6
+# tooling is missing.
+ipv6_enabled='no'
+if [ -x "$ip6tables" ]; then
+	ipv6_enabled='yes'
+fi
+
+# Checking local IPv4 rules
+rules="$HESTIA/data/firewall/rules.conf"
+
+if [ ! -e "$rules" ]; then
+	exit
+fi
+
+# Checking conntrack module avaiabilty
+"$modprobe" nf_conntrack > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+	"$sysctl" net.netfilter.nf_conntrack_max > /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		conntrack='no'
+	fi
+fi
+
+"$modprobe" nf_conntrack_ftp > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+	conntrack_ftp='no'
+fi
+
+chains="$HESTIA/data/firewall/chains.conf"
+banlist="$HESTIA/data/firewall/banlist.conf"
+
+# Detect custom OpenSSH port(s) and update SSH chain
+sshport=$("$BIN/v-list-sys-sshd-port" plain | paste -sd ',' -)
+if [[ "$sshport" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+	sed -i -E "s/(PORT=')[0-9]+(,[0-9]+)*('.*COMMENT='SSH')/\1${sshport}\3/" "$rules"
+	if [[ -f "$chains" ]]; then
+		sed -i "/CHAIN='SSH'/c\\CHAIN='SSH' PORT='${sshport}' PROTOCOL='TCP'" "$chains"
+	else
+		"$BIN/v-add-firewall-chain" 'SSH' "$sshport" 'TCP'
+	fi
+fi
+
+# Load ipset lists before adding Hestia iptables rules
+"$BIN/v-update-firewall-ipset" load
+
+# Creating temporary file
+tmp="$(mktemp)"
+# Parallel ruleset for ip6tables
+tmp6="$(mktemp)"
+
+# Flushing INPUT chain
+echo "$iptables -P INPUT ACCEPT" >> "$tmp"
+echo "$iptables -F INPUT" >> "$tmp"
+if [ "$ipv6_enabled" = 'yes' ]; then
+	echo "$ip6tables -P INPUT ACCEPT" >> "$tmp6"
+	echo "$ip6tables -F INPUT" >> "$tmp6"
+fi
+
+# Handling local traffic
+echo "$iptables -A INPUT -i lo -j ACCEPT" >> "$tmp"
+if [ "$ipv6_enabled" = 'yes' ]; then
+	echo "$ip6tables -A INPUT -i lo -j ACCEPT" >> "$tmp6"
+fi
+ips="$(ls $HESTIA/data/ips)"
+for ip in $ips; do
+	echo "$iptables -A INPUT -s $ip -j ACCEPT" >> "$tmp"
+done
+if [ "$ipv6_enabled" = 'yes' ]; then
+	# Same for the IPv6 addresses paired with this server's IPs
+	for ip6 in $(grep -h "^IP6=" $HESTIA/data/ips/* 2> /dev/null | cut -f 2 -d \' | sort -u); do
+		echo "$ip6tables -A INPUT -s '$ip6' -j ACCEPT" >> "$tmp6"
+	done
+	# IPv6 can't work at all without ICMPv6 neighbour discovery and
+	# router advertisements (and path MTU discovery, which relies on
+	# "packet too big"), none of which are ESTABLISHED/RELATED traffic.
+	# Allow those unconditionally, so suspending or tightening the PING
+	# rule can never cut the server off IPv6.
+	for icmp6_type in destination-unreachable packet-too-big time-exceeded parameter-problem \
+		router-solicitation router-advertisement neighbour-solicitation neighbour-advertisement; do
+		echo "$ip6tables -A INPUT -p icmpv6 --icmpv6-type $icmp6_type -j ACCEPT" >> "$tmp6"
+	done
+	# DHCPv6 client replies, for servers that get their address that way
+	echo "$ip6tables -A INPUT -p udp -s fe80::/10 --dport 546 -j ACCEPT" >> "$tmp6"
+fi
+
+# Enabling stateful support
+if [ "$conntrack" != 'no' ] || grep --quiet container=lxc /proc/1/environ; then
+	str="$iptables -A INPUT -m state"
+	str="$str --state ESTABLISHED,RELATED -j ACCEPT"
+	echo "$str" >> "$tmp"
+	if [ "$ipv6_enabled" = 'yes' ]; then
+		str6="$ip6tables -A INPUT -m state"
+		str6="$str6 --state ESTABLISHED,RELATED -j ACCEPT"
+		echo "$str6" >> "$tmp6"
+	fi
+fi
+
+# Checking fail2ban support
+if [ -n "$FIREWALL_EXTENSION" ]; then
+	if [ -f "$chains" ]; then
+		while IFS= read -r chain; do
+			parse_object_kv_list "$chain"
+			if [[ "$PORT" =~ ,|-|: ]]; then
+				port="-m multiport --dports $PORT"
+			else
+				port="--dport $PORT"
+			fi
+			echo "$iptables -N fail2ban-$CHAIN" >> "$tmp"
+			echo "$iptables -F fail2ban-$CHAIN" >> "$tmp"
+			echo "$iptables -A fail2ban-$CHAIN -s 0.0.0.0/0 -j RETURN" >> "$tmp"
+			echo "$iptables -A INPUT -p $PROTOCOL $port -j fail2ban-$CHAIN" >> "$tmp"
+			# Same chain, mirrored on ip6tables, so a fail2ban jail that
+			# later also bans IPv6 attacker addresses (jail.conf would
+			# need its own IPv6-aware action for that - out of scope
+			# here) has somewhere to insert its DROP rules. Harmless
+			# no-op until such a jail exists.
+			if [ "$ipv6_enabled" = 'yes' ]; then
+				echo "$ip6tables -N fail2ban-$CHAIN" >> "$tmp6"
+				echo "$ip6tables -F fail2ban-$CHAIN" >> "$tmp6"
+				echo "$ip6tables -A fail2ban-$CHAIN -s ::/0 -j RETURN" >> "$tmp6"
+				echo "$ip6tables -A INPUT -p $PROTOCOL $port -j fail2ban-$CHAIN" >> "$tmp6"
+			fi
+		done < "$chains"
+	fi
+
+	if [ -f "$banlist" ]; then
+		while IFS= read -r ban; do
+			parse_object_kv_list "$ban"
+			# An IPv6 address is banned on ip6tables only - it's not a
+			# valid -s match for iptables
+			if [[ "$IP" == *:* ]]; then
+				if [ "$ipv6_enabled" = 'yes' ]; then
+					echo "$ip6tables -I fail2ban-$CHAIN 1 -s '$IP' -j DROP" >> "$tmp6"
+				fi
+			else
+				echo "$iptables -I fail2ban-$CHAIN 1 -s '$IP' -j DROP" >> "$tmp"
+			fi
+		done < "$banlist"
+	fi
+fi
+
+# Pasring iptables rules
+IFS=$'\n'
+for line in $(sort -r -n -k 2 -t \' $rules); do
+	parse_object_kv_list "$line"
+	if [ "$SUSPENDED" = 'no' ]; then
+		proto="-p $PROTOCOL"
+		port="--dport $PORT"
+		state=""
+		action="-j $ACTION"
+
+		# Decide, per rule, whether it has a meaningful IPv6 counterpart
+		# at all:
+		#  - an "ipset:" rule goes to whichever of iptables/ip6tables
+		#    matches the list's own address family (IP_VERSION, set when
+		#    the list was created) - a list's set can only be matched by
+		#    the tables of its own family.
+		#  - a rule scoped to one literal IPv4 address (a monitoring
+		#    host, a DNS cluster peer, etc.) has no IPv6 meaning either -
+		#    that peer's IPv6 address, if any, is a different, unrelated
+		#    value. Skipped.
+		#  - a rule open to the whole internet (IP='0.0.0.0/0', e.g. WEB
+		#    80/443, the HESTIA panel port, mail/FTP ports, the SSH port)
+		#    means exactly the same thing for IPv6: open on all addresses.
+		#    Mirrored.
+		#  - a rule whose IP is IPv6-shaped (now reachable through the
+		#    UI/validator - v-add-firewall-rule accepts an IPv6 CIDR)
+		#    has no IPv4 meaning at all, so it's applied to ip6tables
+		#    ONLY; the IPv4 rule below is skipped entirely for it,
+		#    since an IPv6 address is not a valid -s match for iptables.
+		mirror6='no'
+		skip_v4='no'
+		if [[ "$IP" =~ ^ipset: ]]; then
+			ipset_name="${IP#ipset:}"
+			if ! "$BIN/v-list-firewall-ipset" plain | grep "^$ipset_name\s" > /dev/null; then
+				log_event $E_NOTEXIST "IPset IP list ($ipset_name) not found"
+			fi
+			ip="-m set --match-set '${ipset_name}' src"
+			ip6=""
+			ipset_version="$(grep "^LISTNAME='$ipset_name' " "$HESTIA/data/firewall/ipset.conf" 2> /dev/null | sed -n "s/.* IP_VERSION='\([^']*\)'.*/\1/p")"
+			if [ "$ipset_version" = 'v6' ]; then
+				ip6="$ip"
+				ip=""
+				mirror6='yes'
+				skip_v4='yes'
+			fi
+		elif [ "$IP" = '0.0.0.0/0' ] || [ "$IP" = '0.0.0.0' ]; then
+			ip="-s $IP"
+			ip6="-s ::/0"
+			mirror6='yes'
+		elif [[ "$IP" == *:* ]]; then
+			ip=""
+			ip6="-s '$IP'"
+			mirror6='yes'
+			skip_v4='yes'
+		else
+			ip="-s $IP"
+			ip6=""
+		fi
+
+		# Adding multiport module
+		if [[ "$PORT" =~ ,|-|: ]]; then
+			port="-m multiport --dports ${PORT//-/:}"
+		fi
+
+		# Accepting all dst ports
+		if [[ "$PORT" = "0" ]] || [ "$PROTOCOL" = 'ICMP' ]; then
+			port=""
+		fi
+
+		# Checking FTP for contrack module
+		if [ "$TYPE" = "FTP" ] || [ "$PORT" = '21' ]; then
+			if [ "$conntrack_ftp" != 'no' ]; then
+				state="-m conntrack --ctstate NEW"
+			else
+				port="-m multiport --dports 20,21,12000:12100"
+			fi
+			ftp="yes"
+		fi
+
+		# Adding firewall rule
+		if [ "$skip_v4" != 'yes' ]; then
+			echo "$iptables -A INPUT $proto $port $ip $state $action" >> "$tmp"
+		fi
+		if [ "$ipv6_enabled" = 'yes' ] && [ "$mirror6" = 'yes' ]; then
+			# ICMP maps to ICMPv6 under ip6tables - "-p icmp" is rejected
+			# there, so swap the protocol for the mirrored rule only
+			# (the IPv4 rule above is untouched).
+			proto6="$proto"
+			if [ "$PROTOCOL" = 'ICMP' ]; then
+				proto6="-p icmpv6"
+			fi
+			echo "$ip6tables -A INPUT $proto6 $port $ip6 $state $action" >> "$tmp6"
+		fi
+	fi
+done
+
+# Switching chain policy to DROP
+echo "$iptables -P INPUT DROP" >> "$tmp"
+if [ "$ipv6_enabled" = 'yes' ]; then
+	echo "$ip6tables -P INPUT DROP" >> "$tmp6"
+fi
+
+# Adding hestia chain
+echo "$iptables -N hestia" >> "$tmp"
+if [ "$ipv6_enabled" = 'yes' ]; then
+	echo "$ip6tables -N hestia" >> "$tmp6"
+fi
+# Applying rules
+bash "$tmp" 2> /dev/null
+if [ "$ipv6_enabled" = 'yes' ]; then
+	bash "$tmp6" 2> /dev/null
+fi
+# Deleting temporary file
+rm -f "$tmp" "$tmp6"
+
+# Checking custom trigger
+if [ -x "$HESTIA/data/firewall/custom.sh" ]; then
+	bash "$HESTIA/data/firewall/custom.sh"
+fi
+
+# Clean up and saving rules to the master iptables file
+if [ -d "/etc/sysconfig" ]; then
+	/sbin/iptables-save | sed -e 's/[[0-9]\+:[0-9]\+]/[0:0]/g' -e '/^-A fail2ban-[A-Z]\+ -s .\+$/d' > /etc/sysconfig/iptables
+	if [ "$ipv6_enabled" = 'yes' ]; then
+		/sbin/ip6tables-save | sed -e 's/[[0-9]\+:[0-9]\+]/[0:0]/g' -e '/^-A fail2ban-[A-Z]\+ -s .\+$/d' > /etc/sysconfig/ip6tables
+	fi
+else
+	/sbin/iptables-save | sed -e 's/[[0-9]\+:[0-9]\+]/[0:0]/g' -e '/^-A fail2ban-[A-Z]\+ -s .\+$/d' > /etc/iptables.rules
+	if [ "$ipv6_enabled" = 'yes' ]; then
+		/sbin/ip6tables-save | sed -e 's/[[0-9]\+:[0-9]\+]/[0:0]/g' -e '/^-A fail2ban-[A-Z]\+ -s .\+$/d' > /etc/ip6tables.rules
+	fi
+	iptablesversion="$(iptables --version | head -1 | awk '{print $2}' | cut -f -2 -d .)"
+	sd_unit="/lib/systemd/system/hestia-iptables.service"
+	if [ ! -e "$sd_unit" ]; then
+		echo "[Unit]" >> $sd_unit
+		echo "Description=Loading Hestia firewall rules" >> $sd_unit
+		echo "DefaultDependencies=no" >> $sd_unit
+		echo "Wants=network-pre.target local-fs.target" >> $sd_unit
+		echo "Before=network-pre.target" >> $sd_unit
+		echo "After=local-fs.target" >> $sd_unit
+		echo "" >> $sd_unit
+		echo "[Service]" >> $sd_unit
+		echo "Type=oneshot" >> $sd_unit
+		echo "RemainAfterExit=yes" >> $sd_unit
+		echo "ExecStartPre=-${HESTIA}/bin/v-update-firewall-ipset load" >> $sd_unit
+		if [ "$iptablesversion" = "v1.6" ]; then
+			echo "ExecStart=/sbin/iptables-restore /etc/iptables.rules" >> $sd_unit
+		else
+			echo "ExecStart=/sbin/iptables-restore --wait=10 /etc/iptables.rules" >> $sd_unit
+		fi
+		# Same unit also restores the ip6tables ruleset on boot, if
+		# ip6tables-restore exists - "-" prefix means "don't fail the
+		# whole unit if this particular ExecStart fails" (e.g. IPv6
+		# disabled entirely at the kernel level on this box).
+		echo "ExecStart=-/sbin/ip6tables-restore --wait=10 /etc/ip6tables.rules" >> $sd_unit
+		echo "" >> $sd_unit
+		echo "[Install]" >> $sd_unit
+		echo "WantedBy=multi-user.target" >> $sd_unit
+		systemctl -q daemon-reload
+	fi
+
+	# A unit file created by a Hestia version from before IPv6 support
+	# exists already, but is missing the ip6tables-restore ExecStart
+	# line added above - the "[ ! -e ]" guard above only ever writes a
+	# brand new file, so it never patches one that is already there.
+	# Add the missing line directly after the IPv4 iptables-restore
+	# one, the same way the fresh-install block orders them.
+	if [ -e "$sd_unit" ] && ! grep -q 'ip6tables-restore' "$sd_unit"; then
+		sed -i '/^ExecStart=.*iptables-restore/a ExecStart=-/sbin/ip6tables-restore --wait=10 /etc/ip6tables.rules' "$sd_unit"
+		systemctl -q daemon-reload
+	fi
+
+	systemctl -q is-enabled hestia-iptables 2> /dev/null || systemctl -q enable hestia-iptables
+fi
+
+#----------------------------------------------------------#
+#                       Hestia                             #
+#----------------------------------------------------------#
+
+exit

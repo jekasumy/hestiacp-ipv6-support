@@ -1,0 +1,202 @@
+#!/bin/bash
+# info: change which IPv6 addresses (if any) a DNS zone publishes
+# options: USER DOMAIN IPV6[addresses/no/''] [RESTART] [PREVIOUS]
+#
+# example: v-change-dns-domain-ipv6 admin example.com no
+# example: v-change-dns-domain-ipv6 admin example.com 2a01:4f8:1c1f:7092::1,2a01:4f8:1c1f:7092::2
+#
+# This function changes which IPv6 addresses a DNS zone publishes AAAA
+# records (and SPF ip6: mechanisms) for: pass a comma-separated list of
+# addresses to publish exactly those (they don't need to be the one
+# paired with the zone's own IP), "no" to keep the zone IPv4-only, or an
+# empty value to go back to the default of publishing whatever is paired
+# with the zone's own IP (see v-change-sys-ip-ipv6).
+#
+# It only ever touches records this feature itself manages, and keeps
+# every other record as-is:
+#   - only hosts that have an A record pointing at the zone's own IP get
+#     AAAA records added/removed, and of those only AAAA records whose
+#     value is one of this server's own IPv6 addresses (paired with any
+#     system IP) are ever removed - an AAAA record pointing anywhere else
+#     (a CDN, a different host), or on any other host, is left alone.
+#   - in an SPF record for the zone's own IP, only ip6: mechanisms for
+#     this server's own IPv6 addresses are added/removed; the rest of
+#     the record's value is left untouched.
+#
+# PREVIOUS (optional, comma-separated) lists addresses that may still be
+# published from before but are no longer paired with any system IP -
+# e.g. an IP's old paired address after v-change-sys-ip-ipv6 changed it -
+# so they get cleaned up as well. Also run with the zone's current IPV6
+# setting by v-change-dns-domain-ip and v-change-sys-ip-ipv6 to keep the
+# default ("" - whatever is paired with the zone's IP) in sync.
+
+#----------------------------------------------------------#
+#                Variables & Functions                     #
+#----------------------------------------------------------#
+
+# Argument definition
+user=$1
+domain=$2
+domain_idn=$2
+ip6_list=$3
+restart=$4
+previous=$5
+
+# Includes
+# shellcheck source=/etc/hestiacp/hestia.conf
+source /etc/hestiacp/hestia.conf
+# shellcheck source=/usr/local/hestia/func/main.sh
+source $HESTIA/func/main.sh
+# shellcheck source=/usr/local/hestia/func/domain.sh
+source $HESTIA/func/domain.sh
+# shellcheck source=/usr/local/hestia/func/ip.sh
+source $HESTIA/func/ip.sh
+# shellcheck source=/usr/local/hestia/func/rebuild.sh
+source $HESTIA/func/rebuild.sh
+# load config file
+source_conf "$HESTIA/conf/hestia.conf"
+
+# Additional argument formatting
+format_domain
+format_domain_idn
+
+#----------------------------------------------------------#
+#                    Verifications                         #
+#----------------------------------------------------------#
+
+check_args '3' "$#" "USER DOMAIN IPV6[addresses/no/''] [RESTART] [PREVIOUS]"
+is_format_valid 'user' 'domain' 'restart' 'ip6_list'
+ip6_list="$(normalize_ip6_list "$ip6_list")"
+if [ -n "$previous" ]; then
+	is_ip6_list_format_valid "$previous"
+fi
+# "::" (the wildcard web domains can listen on) is meaningless as an AAAA
+# record
+if [[ ",$ip6_list," == *",::,"* ]]; then
+	check_result "$E_INVALID" "invalid ipv6 list :: '::' can't be published in DNS"
+fi
+is_system_enabled "$DNS_SYSTEM" 'DNS_SYSTEM'
+is_object_valid 'user' 'USER' "$user"
+is_object_unsuspended 'user' 'USER' "$user"
+is_object_valid 'dns' 'DOMAIN' "$domain"
+is_object_unsuspended 'dns' 'DOMAIN' "$domain"
+
+# Perform verification if read-only mode is enabled
+check_hestia_demo_mode
+
+#----------------------------------------------------------#
+#                       Action                             #
+#----------------------------------------------------------#
+
+IPV6=''
+get_domain_values 'dns'
+zone="$USER_DATA/dns/$domain.conf"
+
+# Addresses to publish from now on
+new_ip6s=" $(resolve_ip6_list "$ip6_list" "$IP" | tr ',' ' ') "
+
+# Addresses this feature may have published before: every IPv6 address
+# of this server, whatever the zone was set to before, and $previous
+managed_ip6s="$(get_all_ip6_values) $(resolve_ip6_list "$IPV6" "$IP" | tr ',' ' ') ${previous//,/ }"
+
+# Hosts with an A record pointing at the zone's own IP - the only ones
+# whose AAAA records are managed here. Compared with awk (exact string
+# match) rather than grep, since record names can contain regex/glob
+# characters (e.g. the "*" wildcard).
+zone_records() {
+	awk -v q="'" '
+		function field(k,   m) {
+			if (match($0, " " k "=" q "[^" q "]*" q) || match($0, "^" k "=" q "[^" q "]*" q)) {
+				m = substr($0, RSTART, RLENGTH)
+				sub("^ ?" k "=" q, "", m)
+				sub(q "$", "", m)
+				return m
+			}
+			return ""
+		}
+		{ print field("ID") "\t" field("RECORD") "\t" field("TYPE") "\t" field("VALUE") }
+	' "$zone"
+}
+a_hosts="$(zone_records | awk -F'\t' -v ip="$IP" '$3 == "A" && $4 == ip { print $2 }' | sort -u)"
+
+# Drop what's no longer wanted
+for addr in $managed_ip6s; do
+	if [[ "$new_ip6s" == *" $addr "* ]]; then
+		continue
+	fi
+	ids="$(zone_records | awk -F'\t' -v addr="$addr" -v hosts="$a_hosts" '
+		BEGIN { n = split(hosts, h, "\n"); for (i = 1; i <= n; i++) managed[h[i]] = 1 }
+		$3 == "AAAA" && $4 == addr && ($2 in managed) { print $1 }
+	')"
+	for rid in $ids; do
+		$BIN/v-delete-dns-record "$user" "$domain" "$rid" 'no' 'yes'
+	done
+	sed -i "/TYPE='TXT'/ s/ ip6:$addr\([ \"]\)/\1/g" "$zone"
+done
+
+# Add what's missing - walking the list backwards, since each ip6:
+# mechanism is inserted right after the ip4: one, so they end up in the
+# same order as the list
+ip_re="${IP//./\\.}"
+for addr in $(echo $new_ip6s | tr ' ' '\n' | tac); do
+	while IFS= read -r rname; do
+		[ -z "$rname" ] && continue
+		exists="$(zone_records | awk -F'\t' -v r="$rname" -v addr="$addr" '$2 == r && $3 == "AAAA" && $4 == addr { print $1 }')"
+		if [ -z "$exists" ]; then
+			$BIN/v-add-dns-record "$user" "$domain" "$rname" 'AAAA' "$addr" '' '' 'no' '' 'yes'
+		fi
+	done <<< "$a_hosts"
+	sed -i "/TYPE='TXT'/ { /ip4:${ip_re}[ \"]/ { / ip6:${addr}[ \"]/! s/ip4:$ip_re\([ \"]\)/ip4:$IP ip6:$addr\1/ } }" "$zone"
+done
+
+# Remember the setting. update_object_value can't be used here: it's a
+# pure find/replace that assumes the IPV6= key already exists in the
+# row, which a zone added before this field existed does not - so insert
+# it the first time.
+dns_conf="$USER_DATA/dns.conf"
+row_line="$(grep -n "DOMAIN='$domain' " "$dns_conf" | head -n1)"
+lnr="${row_line%%:*}"
+if [ -n "$lnr" ]; then
+	if echo "${row_line#*:}" | grep -q "IPV6="; then
+		sed -i "$lnr s/IPV6='[^']*'/IPV6='$ip6_list'/" "$dns_conf"
+	else
+		sed -i "$lnr s/DOMAIN='$domain' /DOMAIN='$domain' IPV6='$ip6_list' /" "$dns_conf"
+	fi
+fi
+
+# Update serial
+update_domain_serial
+# Updating zone
+if [[ "$DNS_SYSTEM" =~ named|bind ]]; then
+	rebuild_dns_domain_conf
+fi
+
+# Updating dns-cluster queue
+if [ "$DNS_CLUSTER" = "yes" ]; then
+	dlock=$(grep "domain $user $domain" $HESTIA/data/queue/dns-cluster.pipe)
+	if [ -z "$dlock" ]; then
+		cmd="$BIN/v-add-remote-dns-domain $user $domain yes"
+		echo "$cmd" >> $HESTIA/data/queue/dns-cluster.pipe
+	fi
+fi
+
+#----------------------------------------------------------#
+#                       Hestia                             #
+#----------------------------------------------------------#
+
+# Restarting named
+$BIN/v-restart-dns "$restart"
+check_result $? "DNS restart failed" > /dev/null
+
+# Logging
+if [ "$ip6_list" = 'no' ]; then
+	ipv6_log='disabled'
+elif [ -n "$ip6_list" ]; then
+	ipv6_log="set to $ip6_list"
+else
+	ipv6_log='reset to the IP default'
+fi
+$BIN/v-log-action "$user" "Info" "DNS" "IPv6 $ipv6_log (Domain: $domain)."
+log_event "$OK" "$ARGUMENTS"
+
+exit

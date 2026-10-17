@@ -1,0 +1,120 @@
+#!/bin/bash
+# info: add firewall blocking rule
+# options: IP_CIDR CHAIN
+#
+# example: v-add-firewall-ban 37.120.129.20 MAIL
+# example: v-add-firewall-ban 2001:db8::1 MAIL
+#
+# This function adds new blocking rule to system firewall. IP_CIDR
+# accepts either an IPv4 or an IPv6 address - fail2ban itself is what
+# normally calls this (see install/deb/fail2ban/action.d/hestia.conf),
+# and it will pass an IPv6 address for an attacker that connected over
+# IPv6, now that several services listen on it.
+
+#----------------------------------------------------------#
+#                Variables & Functions                     #
+#----------------------------------------------------------#
+
+# Argument definition
+ipv4_cidr=$1
+chain=$(echo "$2" | tr '[:lower:]' '[:upper:]')
+
+# Defining absolute path for iptables and modprobe
+iptables="/sbin/iptables"
+ip6tables="/sbin/ip6tables"
+
+# Which table this specific address belongs to - set after validation.
+fwtables="$iptables"
+if [[ "$ipv4_cidr" == *:* ]]; then
+	fwtables="$ip6tables"
+fi
+
+# Includes
+# shellcheck source=/etc/hestiacp/hestia.conf
+source /etc/hestiacp/hestia.conf
+# shellcheck source=/usr/local/hestia/func/main.sh
+source $HESTIA/func/main.sh
+# shellcheck source=/usr/local/hestia/func/firewall.sh
+source $HESTIA/func/firewall.sh
+# load config file
+source_conf "$HESTIA/conf/hestia.conf"
+
+#----------------------------------------------------------#
+#                    Verifications                         #
+#----------------------------------------------------------#
+
+check_args '2' "$#" 'IP_CIDR CHAIN'
+is_format_valid 'chain'
+if [[ "$ipv4_cidr" == *:* ]]; then
+	# Calling the validator function directly, not via
+	# is_format_valid 'ipv6_cidr': that dispatcher resolves its
+	# argument by variable NAME ("${!arg_name}"), and the value here
+	# lives in $ipv4_cidr, not in a variable literally named
+	# $ipv6_cidr - going through it would silently skip validation.
+	is_ipv6_cidr_format_valid "$ipv4_cidr"
+	# Same address, same form, however it was typed - so duplicate bans
+	# are caught and v-delete-firewall-ban can find it again
+	ipv4_cidr="$(normalize_ip6 "$ipv4_cidr")"
+else
+	is_format_valid 'ipv4_cidr'
+fi
+is_system_enabled "$FIREWALL_SYSTEM" 'FIREWALL_SYSTEM'
+
+# Perform verification if read-only mode is enabled
+check_hestia_demo_mode
+
+#----------------------------------------------------------#
+#                       Action                             #
+#----------------------------------------------------------#
+
+# Self heal iptables links
+heal_iptables_links
+
+# Checking server ip
+if [ -e "$HESTIA/data/ips/$ipv4_cidr" ] || [ "$ipv4_cidr" = '127.0.0.1' ] || [ "$ipv4_cidr" = '::1' ]; then
+	exit
+fi
+# ...including the IPv6 addresses paired with the server's IPs
+if [[ "$ipv4_cidr" == *:* ]] && grep -qx "IP6='${ipv4_cidr%/128}'" "$HESTIA"/data/ips/* 2> /dev/null; then
+	exit
+fi
+
+# Checking ip exclusions
+excludes="$HESTIA/data/firewall/excludes.conf"
+check_excludes=$(grep "^$ipv4_cidr$" $excludes 2> /dev/null)
+if [ -n "$check_excludes" ]; then
+	exit
+fi
+
+# Checking ip in banlist
+conf="$HESTIA/data/firewall/banlist.conf"
+check_ip=$(grep "IP='$ipv4_cidr' CHAIN='$chain'" $conf 2> /dev/null)
+if [ -n "$check_ip" ]; then
+	exit
+fi
+
+# Adding chain
+$BIN/v-add-firewall-chain $chain
+
+# Generating timestamp
+time_n_date=$(date +'%T %F')
+time=$(echo "$time_n_date" | cut -f 1 -d \ )
+date=$(echo "$time_n_date" | cut -f 2 -d \ )
+
+# Adding ip to banlist
+echo "IP='$ipv4_cidr' CHAIN='$chain' TIME='$time' DATE='$date'" >> $conf
+$fwtables -I fail2ban-$chain 1 -s "$ipv4_cidr" \
+	-j DROP 2> /dev/null
+
+# Changing permissions
+chmod 660 $conf
+
+#----------------------------------------------------------#
+#                       Hestia                             #
+#----------------------------------------------------------#
+
+# Logging
+$BIN/v-log-action "system" "Warning" "Firewall" "Banned IP address $ipv4_cidr."
+log_event "$OK" "$ARGUMENTS"
+
+exit

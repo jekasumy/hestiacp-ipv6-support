@@ -1,0 +1,106 @@
+#!/bin/bash
+# info: change dns domain ip address
+# options: USER DOMAIN IP [RESTART]
+#
+# example: v-change-dns-domain-ip admin domain.com 123.212.111.222
+#
+# This function for changing the main ip of DNS zone.
+
+#----------------------------------------------------------#
+#                Variables & Functions                     #
+#----------------------------------------------------------#
+
+# Argument definition
+user=$1
+domain=$2
+domain_idn=$2
+ip=$3
+restart=$4
+
+# Includes
+# shellcheck source=/etc/hestiacp/hestia.conf
+source /etc/hestiacp/hestia.conf
+# shellcheck source=/usr/local/hestia/func/main.sh
+source $HESTIA/func/main.sh
+# shellcheck source=/usr/local/hestia/func/domain.sh
+source $HESTIA/func/domain.sh
+# shellcheck source=/usr/local/hestia/func/rebuild.sh
+source $HESTIA/func/rebuild.sh
+# load config file
+source_conf "$HESTIA/conf/hestia.conf"
+
+# Additional argument formatting
+format_domain
+format_domain_idn
+# TODO: $domain_idn not used in this script - maybe $domain should be converted to $doman_idn ?
+
+#----------------------------------------------------------#
+#                    Verifications                         #
+#----------------------------------------------------------#
+
+check_args '3' "$#" 'USER DOMAIN IP [RESTART]'
+is_format_valid 'user' 'domain' 'ip' 'restart'
+is_system_enabled "$DNS_SYSTEM" 'DNS_SYSTEM'
+is_object_valid 'user' 'USER' "$user"
+is_object_unsuspended 'user' 'USER' "$user"
+is_object_valid 'dns' 'DOMAIN' "$domain"
+is_object_unsuspended 'dns' 'DOMAIN' "$domain"
+
+# Perform verification if read-only mode is enabled
+check_hestia_demo_mode
+
+#----------------------------------------------------------#
+#                       Action                             #
+#----------------------------------------------------------#
+
+# Get old ip
+IPV6=''
+get_domain_values 'dns'
+old=$IP
+old_ip6="$(resolve_ip6_list "$IPV6" "$old")"
+
+# Changing ip
+update_object_value 'dns' 'DOMAIN' "$domain" '$IP' "$ip"
+
+# Changing records
+sed -i "s/$old/$ip/g" $USER_DATA/dns/$domain.conf
+
+# Update serial
+update_domain_serial
+# Updating zone
+if [[ "$DNS_SYSTEM" =~ named|bind ]]; then
+	rebuild_dns_domain_conf
+fi
+
+# Updating dns-cluster queue
+if [ "$DNS_CLUSTER" = "yes" ]; then
+	# Check for first sync
+	dlock=$(grep "domain $user $domain" $HESTIA/data/queue/dns-cluster.pipe)
+	if [ -z "$dlock" ]; then
+		cmd="$BIN/v-add-remote-dns-domain $user $domain yes"
+		echo "$cmd" >> $HESTIA/data/queue/dns-cluster.pipe
+	fi
+fi
+
+#----------------------------------------------------------#
+#                       Hestia                             #
+#----------------------------------------------------------#
+
+# AAAA records / SPF ip6: mechanisms: by default the zone publishes the
+# IPv6 address paired with its own IP, which may differ for the new IP.
+# The old IP's address is passed on so records still pointing at it get
+# replaced.
+if [ "$IPV6" != 'no' ]; then
+	[ "$IPV6" = 'yes' ] && IPV6=''
+	$BIN/v-change-dns-domain-ipv6 "$user" "$domain" "$IPV6" 'no' "$old_ip6"
+fi
+
+# Restarting named
+$BIN/v-restart-dns "$restart"
+check_result $? "DNS restart failed" > /dev/null
+
+# Logging
+$BIN/v-log-action "$user" "Info" "DNS" "IP address for DNS domain changed (IP: $ip, Domain: $domain)."
+log_event "$OK" "$ARGUMENTS"
+
+exit

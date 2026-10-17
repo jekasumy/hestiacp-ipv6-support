@@ -1,0 +1,129 @@
+#!/bin/bash
+# info: change IPv6 address paired with a system IP
+# options: IP [IPV6]
+#
+# example: v-change-sys-ip-ipv6 203.0.113.1 2001:db8::1
+#
+# This function pairs an IPv6 address with an existing system (IPv4) IP,
+# without making any network-configuration changes of its own: it is
+# meant for an IPv6 address that is already configured on the system
+# (outside of Hestia, or by hand). Every web domain that uses this
+# system IP will then have its web server configuration listen on this
+# specific IPv6 address as well, instead of relying on the server's
+# wildcard IPv6 listener. Call with an empty IPV6 argument to remove an
+# existing pairing.
+#
+# To provision a genuinely new IPv6 address on the interface (bring it
+# up, persist it in netplan/interfaces) and pair it in one step, use
+# v-add-sys-ip's own IPV6_CIDR argument instead - either when first
+# adding the system IP, or by deleting and re-adding it.
+#
+# Because this script never touches the network configuration, it
+# always clears any IP6_PREFIX recorded by v-add-sys-ip: that field is
+# only meaningful for an address Hestia itself provisioned and knows
+# how to remove again later (see v-delete-sys-ip). Re-pairing through
+# this script does not remove a previously provisioned address from
+# the interface - it only stops Hestia from using it in web configs.
+#
+# Pass the literal value "auto" for IPV6 instead of an address to have
+# this command look up and pair whatever global IPv6 address is
+# already configured on this IP's interface (outside of Hestia) -
+# useful when the provider already handed out an address via
+# SLAAC/DHCPv6 and you don't want to copy it in by hand.
+
+#----------------------------------------------------------#
+#                Variables & Functions                     #
+#----------------------------------------------------------#
+
+# Argument definition
+ip="$1"
+ipv6="$2"
+
+# Includes
+# shellcheck source=/etc/hestiacp/hestia.conf
+source /etc/hestiacp/hestia.conf
+# shellcheck source=/usr/local/hestia/func/main.sh
+source $HESTIA/func/main.sh
+# shellcheck source=/usr/local/hestia/func/ip.sh
+source $HESTIA/func/ip.sh
+# shellcheck source=/usr/local/hestia/func/domain.sh
+source $HESTIA/func/domain.sh
+# load config file
+source_conf "$HESTIA/conf/hestia.conf"
+
+#----------------------------------------------------------#
+#                    Verifications                         #
+#----------------------------------------------------------#
+
+check_args '1' "$#" 'IP [IPV6]'
+is_format_valid 'ip'
+is_ip_valid "$ip"
+
+if [ "$ipv6" = 'auto' ]; then
+	auto_iface="$(grep "^INTERFACE=" "$HESTIA/data/ips/$ip" | cut -f 2 -d \')"
+	ipv6="$(detect_iface_global_ipv6 "$auto_iface" "$ip")"
+	if [ -z "$ipv6" ]; then
+		check_result "$E_NOTEXIST" "no unpaired global IPv6 address found on interface ${auto_iface:-(unknown)} to auto-pair"
+	fi
+fi
+
+is_format_valid 'ipv6'
+if [ -n "$ipv6" ]; then
+	# Store addresses in one canonical form, so the same address always
+	# compares equal (domains' IPV6 lists, DNS records, duplicate checks)
+	ipv6="$(normalize_ip6 "$ipv6")"
+	is_ip6_pairable "$ipv6" "$ip"
+	# This only pairs an address that's already configured - the web
+	# server couldn't listen on one the system doesn't have
+	if ! is_ip6_on_system "$ipv6"; then
+		check_result "$E_NOTEXIST" "IPv6 address $ipv6 isn't configured on any interface of this server (add it to the system first, or use v-add-sys-ip with a prefix to have it added)"
+	fi
+fi
+
+# Perform verification if read-only mode is enabled
+check_hestia_demo_mode
+
+#----------------------------------------------------------#
+#                       Action                             #
+#----------------------------------------------------------#
+
+old_ip6="$(grep "^IP6=" "$HESTIA/data/ips/$ip" | cut -f 2 -d \')"
+old_ip6_prefix="$(grep "^IP6_PREFIX=" "$HESTIA/data/ips/$ip" | cut -f 2 -d \')"
+if [ "$old_ip6" = "$ipv6" ]; then
+	exit
+fi
+
+# Updating IP
+if [ -z "$(grep "^IP6=" $HESTIA/data/ips/$ip)" ]; then
+	sed -i "s/^TIME/IP6='$ipv6'\nTIME/g" $HESTIA/data/ips/$ip
+else
+	sed -i "s/IP6=.*/IP6='$ipv6'/" $HESTIA/data/ips/$ip
+fi
+
+# This script only pairs an address that's already configured on the
+# system - it never provisions one. If Hestia provisioned the previous
+# address itself (IP6_PREFIX is only recorded by v-add-sys-ip when it
+# actually added it), remove it again, the same way v-delete-sys-ip
+# would, rather than leaving an address nothing uses on the interface.
+if [ -n "$old_ip6" ] && [ -n "$old_ip6_prefix" ]; then
+	deprovision_ip6 "$old_ip6" "$old_ip6_prefix" "$(get_ip_value '$INTERFACE')"
+fi
+if [ -z "$(grep "^IP6_PREFIX=" $HESTIA/data/ips/$ip)" ]; then
+	sed -i "s/^TIME/IP6_PREFIX=''\nTIME/g" $HESTIA/data/ips/$ip
+else
+	sed -i "s/IP6_PREFIX=.*/IP6_PREFIX=''/" $HESTIA/data/ips/$ip
+fi
+
+# Catch-all vhosts, web domains, webmail and DNS zones that use the
+# pairing (see sync_ip6_pairing_change in func/ip.sh)
+sync_ip6_pairing_change "$ip" "$old_ip6"
+
+#----------------------------------------------------------#
+#                       Hestia                             #
+#----------------------------------------------------------#
+
+# Logging
+$BIN/v-log-action "system" "Info" "System" "Changed IPv6 address on $ip to $ipv6."
+log_event "$OK" "$ARGUMENTS"
+
+exit

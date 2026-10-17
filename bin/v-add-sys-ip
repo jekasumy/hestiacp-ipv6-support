@@ -1,0 +1,343 @@
+#!/bin/bash
+# info: add system IP address
+# options: IP NETMASK [INTERFACE] [USER] [IP_STATUS] [IP_NAME] [NAT_IP] [IPV6_CIDR]
+#
+# example: v-add-sys-ip 203.0.113.1 255.255.255.0
+# example: v-add-sys-ip 203.0.113.1 255.255.255.0 eth0 admin shared '' '' 2001:db8::1/64
+#
+# This function adds IP address into a system. It also creates rc scripts. You
+# can specify IP name which will be used as root domain for temporary aliases.
+# For example, if you set a1.myhosting.com as name, each new domain created on
+# this IP will automatically receive alias $domain.a1.myhosting.com. Of course
+# you must have wildcard record *.a1.myhosting.com pointed to IP. This feature
+# is very handy when customer wants to test domain before dns migration.
+#
+# An optional IPV6_CIDR (an IPv6 address with an explicit prefix length,
+# e.g. 2001:db8::1/64) can be given to also provision an IPv6 address on
+# the same interface and pair it with this system IP, so that web domains
+# using it listen on that IPv6 address too (see func/domain.sh's %ip6%
+# template macro). This is for a genuinely new address that still needs
+# to be brought up on the interface. To pair an IPv6 address that is
+# already configured on the system (outside of Hestia) with an existing
+# system IP, without touching the network configuration, use
+# v-change-sys-ip-ipv6 instead.
+#
+# When IPV6_CIDR is left out entirely, this interface is checked for an
+# IPv6 address that's already configured on it outside of Hestia (most
+# commonly one the hosting provider already hands out via SLAAC/DHCPv6)
+# and, if one is found, it's paired automatically - the same as passing
+# it to v-change-sys-ip-ipv6 by hand, but without having to look it up
+# first. Pass the literal value "none" for IPV6_CIDR to add this IP
+# without any IPv6 pairing even when the interface does have one.
+
+#----------------------------------------------------------#
+#                Variables & Functions                     #
+#----------------------------------------------------------#
+
+# Argument definition
+ip="${1// /}"
+netmask="$2"
+
+# Get interface name
+# First try to detect which interface the IP address resides on
+iface="$(ip -d -j addr show | jq --arg IP "$ip" -r '.[] | if .addr_info[].local == $IP then .ifname else empty end')"
+# If that fails, detect the default interface as a fallback
+if [ -z "$iface" ]; then
+	iface="$(ip -d -j route show | jq -r '.[] | if .dst == "default" then .dev else empty end')"
+fi
+
+iface="${3-$iface}"
+user="$4"
+ip_status="${5-shared}"
+ip_name="$6"
+nat_ip="$7"
+ipv6_cidr="$8"
+
+# Includes
+# shellcheck source=/etc/hestiacp/hestia.conf
+source /etc/hestiacp/hestia.conf
+# shellcheck source=/usr/local/hestia/func/main.sh
+source $HESTIA/func/main.sh
+# shellcheck source=/usr/local/hestia/func/ip.sh
+source $HESTIA/func/ip.sh
+# shellcheck source=/usr/local/hestia/func/domain.sh
+source $HESTIA/func/domain.sh
+# shellcheck source=/usr/local/hestia/func/syshealth.sh
+source "$HESTIA/func/syshealth.sh"
+# load config file
+source_conf "$HESTIA/conf/hestia.conf"
+
+if [ -z "$4" ]; then
+	user="$ROOT_USER"
+fi
+
+#----------------------------------------------------------#
+#                    Verifications                         #
+#----------------------------------------------------------#
+
+check_args '2' "$#" 'IP NETMASK [INTERFACE] [USER] [STATUS] [NAME] [NATED_IP] [IPV6_CIDR]'
+is_format_valid 'ip' 'netmask' 'iface' 'user' 'ip_status'
+is_ip_free
+is_object_valid 'user' 'USER' "$user"
+is_object_unsuspended 'user' 'USER' "$user"
+if [ -n "$ip_name" ]; then
+	is_format_valid 'ip_name'
+fi
+if [ -n "$nat_ip" ]; then
+	is_format_valid 'nat_ip'
+fi
+if [ "$ipv6_cidr" = 'none' ]; then
+	# Explicit opt-out: add this IP with no IPv6 pairing, even if the
+	# interface already has one.
+	ipv6_cidr=''
+elif [ -z "$ipv6_cidr" ]; then
+	# Nothing given either way - check whether this interface already
+	# has a usable IPv6 address configured outside of Hestia, and pair
+	# that automatically.
+	auto_ipv6_addr="$(detect_iface_global_ipv6 "$iface")"
+	if [ -n "$auto_ipv6_addr" ]; then
+		ipv6_addr="$auto_ipv6_addr"
+		ipv6_prefix=''
+	fi
+fi
+if [ -n "$ipv6_cidr" ]; then
+	# A bare address without an explicit prefix would silently pass
+	# this validator at an assumed /128, which is almost never what
+	# was intended - require the prefix to be spelled out.
+	if [[ "$ipv6_cidr" != */* ]]; then
+		check_result "$E_INVALID" "IPV6_CIDR must include a prefix length, e.g. 2001:db8::1/64 :: $ipv6_cidr"
+	fi
+	is_format_valid 'ipv6_cidr'
+	# Canonical form, so the same address always compares equal
+	ipv6_addr="$(normalize_ip6 "${ipv6_cidr%%/*}")"
+	ipv6_prefix="${ipv6_cidr##*/}"
+	ipv6_cidr="$ipv6_addr/$ipv6_prefix"
+fi
+if [ -n "$ipv6_addr" ]; then
+	is_ip6_pairable "$ipv6_addr" "$ip"
+fi
+if [ "$user" != "$ROOT_USER" ]; then
+	ip_status="dedicated"
+fi
+
+# Perform verification if read-only mode is enabled
+check_hestia_demo_mode
+
+#----------------------------------------------------------#
+#                       Action                             #
+#----------------------------------------------------------#
+
+cidr="$(convert_netmask "$netmask")"
+broadcast="$(get_broadcast "$ip" "$netmask")"
+
+sys_ip_check="$(ip addr | grep -w "$ip")"
+sys_ip6_check=""
+if [ -n "$ipv6_cidr" ] && is_ip6_on_system "$ipv6_addr"; then
+	sys_ip6_check="yes"
+	# Already configured outside of Hestia: only pair it. IP6_PREFIX is
+	# what tells v-delete-sys-ip that Hestia added the address itself and
+	# may remove it again - it must not be recorded for this one.
+	ipv6_prefix=''
+fi
+
+# Check if netplan is in use and generate configuration file. Done
+# whenever the IPv4 address or the (optional) IPv6 address still needs
+# adding - not only when the IPv4 one does, because the IPv6 address
+# below may still need provisioning even when the IPv4 one already
+# exists on the interface.
+need_address_add="false"
+[ -z "$sys_ip_check" ] && need_address_add="true"
+if [ -n "$ipv6_cidr" ] && [ -z "$sys_ip6_check" ]; then
+	need_address_add="true"
+fi
+if [ "$need_address_add" = "true" ]; then
+	if [ -n "$(netplan generate --mapping "$iface" 2> /dev/null | grep networkd)" ]; then
+		netplan="true"
+	else
+		netplan="false"
+	fi
+
+	if [ "$netplan" = "true" ]; then
+		netplan_file="/etc/netplan/60-hestia.yaml"
+		if [ -f "$netplan_file" ]; then
+			netplan_file_exists="true"
+		else
+			netplan_file_exists="false"
+			install -m 600 /dev/null "$netplan_file"
+		fi
+	fi
+fi
+
+if [ -z "$sys_ip_check" ]; then
+	# Adding system IP
+	ip addr add "$ip/$cidr" dev "$iface" broadcast "$broadcast" label "$iface"
+
+	if [ "$netplan" = "true" ]; then
+		if [ "$netplan_file_exists" = "true" ]; then
+			sys_ip="        - $ip/$cidr"
+		else
+			sys_ip="# Added by Hestia, please do not edit the file manually!"
+			sys_ip="$sys_ip\nnetwork:"
+			sys_ip="$sys_ip\n  version: 2"
+			sys_ip="$sys_ip\n  renderer: networkd"
+			sys_ip="$sys_ip\n  ethernets:"
+			sys_ip="$sys_ip\n    $iface:"
+			sys_ip="$sys_ip\n      addresses:"
+			sys_ip="$sys_ip\n        - $ip/$cidr"
+		fi
+		IFS='%'
+		echo -e "$sys_ip" >> "$netplan_file"
+		unset IFS
+		# Any further address appended to this file (the IPv6 one
+		# below included) now finds it already in place.
+		netplan_file_exists="true"
+	else
+		sys_ip="\n# Added by Hestia Control Panel"
+		sys_ip="$sys_ip\nauto $iface"
+		sys_ip="$sys_ip\niface $iface inet static"
+		sys_ip="$sys_ip\naddress $ip"
+		sys_ip="$sys_ip\nnetmask $netmask"
+		echo -e $sys_ip >> /etc/network/interfaces
+	fi
+fi
+
+# Adding the paired IPv6 address, if one was given
+if [ -n "$ipv6_cidr" ] && [ -z "$sys_ip6_check" ] && ! ip -6 addr add "$ipv6_cidr" dev "$iface"; then
+	# Couldn't add it - don't persist it, and don't pair it either: the
+	# web server can't listen on an address the system doesn't have
+	echo "Warning: couldn't add IPv6 address $ipv6_cidr to $iface - the IP is added without an IPv6 address paired" >&2
+	ipv6_addr=''
+	ipv6_prefix=''
+	sys_ip6_check="failed"
+fi
+if [ -n "$ipv6_cidr" ] && [ -z "$sys_ip6_check" ]; then
+
+	if [ "$netplan" = "true" ]; then
+		if [ "$netplan_file_exists" = "true" ]; then
+			# Re-use the same addresses: list the IPv4 block above
+			# either created or appended to - netplan accepts mixed
+			# IPv4/IPv6 CIDR strings in the same list.
+			echo -e "        - $ipv6_cidr" >> "$netplan_file"
+		else
+			sys_ip6="# Added by Hestia, please do not edit the file manually!"
+			sys_ip6="$sys_ip6\nnetwork:"
+			sys_ip6="$sys_ip6\n  version: 2"
+			sys_ip6="$sys_ip6\n  renderer: networkd"
+			sys_ip6="$sys_ip6\n  ethernets:"
+			sys_ip6="$sys_ip6\n    $iface:"
+			sys_ip6="$sys_ip6\n      addresses:"
+			sys_ip6="$sys_ip6\n        - $ipv6_cidr"
+			IFS='%'
+			echo -e "$sys_ip6" >> "$netplan_file"
+			unset IFS
+		fi
+	else
+		# ifupdown keeps IPv4 and IPv6 on the same interface in
+		# separate stanzas; "auto $iface" was already added (or
+		# already existed) above/outside of Hestia, so it is not
+		# repeated here.
+		sys_ip6="\n# Added by Hestia Control Panel (IPv6)"
+		sys_ip6="$sys_ip6\niface $iface inet6 static"
+		sys_ip6="$sys_ip6\naddress $ipv6_addr"
+		sys_ip6="$sys_ip6\nnetmask $ipv6_prefix"
+		echo -e $sys_ip6 >> /etc/network/interfaces
+	fi
+fi
+
+# Generating timestamp
+new_timestamp
+
+# Adding Hestia IP
+echo "OWNER='$user'
+STATUS='$ip_status'
+NAME='$ip_name'
+U_SYS_USERS=''
+U_WEB_DOMAINS='0'
+INTERFACE='$iface'
+NETMASK='$netmask'
+NAT='$nat_ip'
+IP6='$ipv6_addr'
+IP6_PREFIX='$ipv6_prefix'
+TIME='$time'
+DATE='$date'" > $HESTIA/data/ips/$ip
+chmod 660 $HESTIA/data/ips/$ip
+
+# Per-IP catch-all vhosts (web server and proxy)
+write_sys_ip_catchall_configs "$ip"
+
+# Proxy support
+if [ -n "$PROXY_SYSTEM" ]; then
+	# mod_extract_forwarded
+	fw_conf="/etc/$WEB_SYSTEM/conf.d/mod_extract_forwarded.conf"
+	if [ -e "$fw_conf" ]; then
+		ips=$(grep 'MEFaccept ' "$fw_conf" | grep -v '#' | head -n1)
+		sed -i "s/$ips/$ips $ip/g" "$fw_conf"
+	fi
+
+	# mod_rpaf
+	rpaf_conf="/etc/$WEB_SYSTEM/mods-enabled/rpaf.conf"
+	if [ -e "$rpaf_conf" ]; then
+		rpaf_str="$(grep RPAFproxy_ips "$rpaf_conf")"
+		[ -z "$rpaf_str" ] && sed -i 's|</IfModule>|RPAFproxy_ips\n</IfModule>|' "$rpaf_conf" && rpaf_str='RPAFproxy_ips'
+		rpaf_str="$rpaf_str $ip"
+		sed -i "s/.*RPAFproxy_ips.*/$rpaf_str/" "$rpaf_conf"
+	fi
+
+	# mod_remoteip
+	remoteip_conf="/etc/$WEB_SYSTEM/mods-enabled/remoteip.conf"
+	if [ -e "$remoteip_conf" ]; then
+		if [ "$(grep -ic "$ip" "$remoteip_conf")" -eq "0" ]; then
+			sed -i "s/<\/IfModule>/RemoteIPInternalProxy $ip\n<\/IfModule>/g" "$remoteip_conf"
+		fi
+	fi
+fi
+
+# Adapt Port Listing in HESTIA NGINX Backend
+syshealth_adapt_hestia_nginx_listen_ports
+# Also update resolver
+syshealth_adapt_nginx_resolver
+#----------------------------------------------------------#
+#                       Hestia                             #
+#----------------------------------------------------------#
+
+# Updating user counters
+increase_user_value "$user" '$IP_OWNED'
+if [ "$user" = $ROOT_USER ]; then
+	if [ "$ip_status" = 'shared' ]; then
+		for hestia_user in $("$BIN/v-list-users" list); do
+			increase_user_value "$hestia_user" '$IP_AVAIL'
+		done
+	else
+		increase_user_value $ROOT_USER '$IP_AVAIL'
+	fi
+else
+	increase_user_value "$user" '$IP_AVAIL'
+	increase_user_value $ROOT_USER '$IP_AVAIL'
+fi
+
+# Restarting web server
+$BIN/v-restart-web
+check_result $? "Web restart failed" > /dev/null
+
+# Restarting proxy server
+if [ -n "$PROXY_SYSTEM" ]; then
+	$BIN/v-restart-proxy
+	check_result $? "Proxy restart failed" > /dev/null
+fi
+
+# Restarting firewall
+if [ -n "$FIREWALL_SYSTEM" ]; then
+	$BIN/v-update-firewall
+fi
+
+# Restarting hestia service if nginx backend config was changed
+if [ "$NGINX_BCONF_CHANGED" = "yes" -a -f "/etc/init.d/hestia" ]; then
+	systemctl restart hestia > /dev/null 2>&1
+	check_result $? "Hestia backend restart failed" > /dev/null
+fi
+
+# Logging
+$BIN/v-log-action "system" "Info" "Network" "Added new IP address to the system (IP: $ip)."
+log_event "$OK" "$ARGUMENTS"
+
+exit
