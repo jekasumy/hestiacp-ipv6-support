@@ -92,8 +92,8 @@ of an existing Hestia server and can be removed again.
   panel.
 
 **Panel**
-- All new interface strings are translatable; Russian translations are
-  included.
+- All new interface strings are translatable; Russian and Ukrainian
+  translations are included (English is the source language).
 
 ## Requirements and compatibility
 
